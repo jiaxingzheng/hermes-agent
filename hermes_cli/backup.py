@@ -39,6 +39,8 @@ _EXCLUDED_DIRS = {
     "backups",          # prior auto-backups — don't nest backups exponentially
     "checkpoints",      # session-local trajectory caches — regenerated per-session,
                         # session-hash-keyed so they don't port to another machine anyway
+    "node",             # system Node.js install — re-installed via package manager
+    "logs",             # log files — not needed in backup
 }
 
 # File-name suffixes to skip
@@ -59,7 +61,15 @@ _EXCLUDED_SUFFIXES = (
 _EXCLUDED_NAMES = {
     "gateway.pid",
     "cron.pid",
+    "models_dev_cache.json",
+    "ollama_cloud_models_cache.json",
+    "state.db-wal",
 }
+
+# Directories to skip (matched against full relative path prefix)
+_EXCLUDED_PATH_PREFIXES = (
+    "cron/output",
+)
 
 
 def _should_exclude(rel_path: Path) -> bool:
@@ -78,6 +88,27 @@ def _should_exclude(rel_path: Path) -> bool:
 
     if name.endswith(_EXCLUDED_SUFFIXES):
         return True
+
+    # Check excluded path prefixes (e.g. "cron/output")
+    rel_str = str(rel_path)
+    for prefix in _EXCLUDED_PATH_PREFIXES:
+        if rel_str.startswith(prefix):
+            return True
+
+    # Exclude old session files (older than 7 days)
+    # Session files are in sessions/ dir and named like <timestamp>.json
+    if len(parts) >= 2 and parts[0] == "sessions" and name.endswith(".json"):
+        try:
+            # Session filenames are timestamps like 20240101-120000.json
+            stem = name.rsplit(".", 1)[0]
+            # Try to parse as timestamp (YYYYMMDD-HHMMSS)
+            file_time = datetime.strptime(stem[:15], "%Y%m%d-%H%M%S")
+            file_time = file_time.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - file_time).days
+            if age_days > 7:
+                return True
+        except (ValueError, IndexError):
+            pass  # Not a timestamped session file, include it
 
     return False
 

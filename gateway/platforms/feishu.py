@@ -566,11 +566,282 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     return rows or [[{"tag": "md", "text": content}]]
 
 
-def parse_feishu_post_payload(
-    payload: Any,
-    *,
-    mentions_map: Optional[Dict[str, FeishuMentionRef]] = None,
-) -> FeishuPostParseResult:
+# ---------------------------------------------------------------------------
+# Markdown table parsing and card payload builders
+# ---------------------------------------------------------------------------
+
+_MARKDOWN_TABLE_RE = re.compile(
+    r"^[ \t]*(.+\|.+)\|[ \t]*$\n"  # header row (contains |, ends with |)
+    r"^[ \t]*[-:| \t-]+[ \t]*$\n"  # separator row (dashes, colons, pipes, spaces)
+    r"((?:^[ \t]*(.+\|.+)\|[ \t]*$\n?)+)",  # data rows (contain |, end with |)
+    re.MULTILINE,
+)
+
+# Alternative pattern for tables without trailing pipes
+_MARKDOWN_TABLE_NO_TRAILING_PIPE_RE = re.compile(
+    r"^[ \t]*(.+[ \t]\|[ \t].+)[ \t]*$\n"  # header row (contains | with spaces around)
+    r"^[ \t]*[-:| \t-]+[ \t]*$\n"  # separator row
+    r"((?:^[ \t]*(.+[ \t]\|[ \t].+)[ \t]*$\n?)+)",  # data rows
+    re.MULTILINE,
+)
+
+
+def _parse_markdown_table(content: str) -> Optional[Dict[str, Any]]:
+    """Parse a Markdown table from content and return structured data.
+
+    Returns None if no valid table is found.
+    Returns dict with 'headers' and 'rows' if table is found.
+    Also returns 'before' and 'after' text surrounding the table.
+    """
+    # Try first pattern (with trailing pipes)
+    match = _MARKDOWN_TABLE_RE.search(content)
+
+    # If no match, try second pattern (without trailing pipes)
+    if not match:
+        match = _MARKDOWN_TABLE_NO_TRAILING_PIPE_RE.search(content)
+
+    if not match:
+        return None
+
+    # Extract headers (group 1)
+    header_line = match.group(1)
+    headers = [cell.strip() for cell in header_line.split("|")]
+    # Remove empty first/last cells if line started/ended with |
+    if headers and not headers[0]:
+        headers = headers[1:]
+    if headers and not headers[-1]:
+        headers = headers[:-1]
+
+    # Extract data rows (group 2 contains all data rows)
+    data_block = match.group(2)
+    rows = []
+    for line in data_block.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Split by | and get cells
+        cells = [cell.strip() for cell in line.split("|")]
+        # Remove empty first/last cells if line started/ended with |
+        if cells and not cells[0]:
+            cells = cells[1:]
+        if cells and not cells[-1]:
+            cells = cells[:-1]
+        rows.append(cells)
+
+    # Get text before and after the table
+    before = content[:match.start()].strip()
+    after = content[match.end():].strip()
+
+    return {
+        "headers": headers,
+        "rows": rows,
+        "before": before,
+        "after": after,
+    }
+
+
+def _parse_single_table(text: str) -> Optional[Dict[str, Any]]:
+    """Parse a single Markdown table from text. Returns dict with headers/rows or None."""
+    match = _MARKDOWN_TABLE_RE.search(text)
+    if not match:
+        match = _MARKDOWN_TABLE_NO_TRAILING_PIPE_RE.search(text)
+    if not match:
+        return None
+
+    header_line = match.group(1)
+    headers = [cell.strip() for cell in header_line.split("|")]
+    # Remove empty first/last cells if line started/ended with |
+    if headers and not headers[0]:
+        headers = headers[1:]
+    if headers and not headers[-1]:
+        headers = headers[:-1]
+
+    data_block = match.group(2)
+    rows = []
+    for line in data_block.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        cells = [cell.strip() for cell in line.split("|")]
+        if cells and not cells[0]:
+            cells = cells[1:]
+        if cells and not cells[-1]:
+            cells = cells[:-1]
+        rows.append(cells)
+
+    return {
+        "headers": headers,
+        "rows": rows,
+        "start": match.start(),
+        "end": match.end(),
+    }
+
+
+def _parse_all_markdown_tables(content: str) -> List[Dict[str, Any]]:
+    """Parse ALL Markdown tables from content.
+
+    Returns a list of elements in document order. Each element is either:
+      - {"type": "text", "content": "some text"}
+      - {"type": "table", "headers": [...], "rows": [[...], ...]}
+    """
+    elements: List[Dict[str, Any]] = []
+    remaining = content
+    offset = 0
+
+    while remaining:
+        match = _MARKDOWN_TABLE_RE.search(remaining)
+        if not match:
+            match = _MARKDOWN_TABLE_NO_TRAILING_PIPE_RE.search(remaining)
+        if not match:
+            # No more tables, add remaining text
+            text = remaining.strip()
+            if text:
+                elements.append({"type": "text", "content": text})
+            break
+
+        # Text before this table
+        before = remaining[:match.start()].strip()
+        if before:
+            elements.append({"type": "text", "content": before})
+
+        # Parse the table
+        header_line = match.group(1)
+        headers = [cell.strip() for cell in header_line.split("|")]
+
+        data_block = match.group(2)
+        rows = []
+        for line in data_block.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            cells = [cell.strip() for cell in line.split("|")]
+            if cells and not cells[0]:
+                cells = cells[1:]
+            if cells and not cells[-1]:
+                cells = cells[:-1]
+            rows.append(cells)
+
+        elements.append({
+            "type": "table",
+            "headers": headers,
+            "rows": rows,
+        })
+
+        # Continue searching after this table
+        remaining = remaining[match.end():]
+
+    return elements
+
+
+def _detect_data_type(values: List[str]) -> str:
+    """Detect the best data_type for a column based on its values."""
+    has_number = False
+    has_text = False
+
+    for val in values:
+        val = val.strip()
+        if not val:
+            continue
+        # Try to parse as number (with optional % or currency symbols)
+        cleaned = re.sub(r"[%¥$€£,+\-]", "", val).strip()
+        try:
+            float(cleaned)
+            has_number = True
+        except ValueError:
+            has_text = True
+
+    if has_number and not has_text:
+        return "number"
+    return "text"
+
+
+def _build_table_element(headers: List[str], rows: List[List[str]]) -> Dict[str, Any]:
+    """Build a single table element for a Feishu card."""
+    columns = []
+    for i, header in enumerate(headers):
+        col_name = f"col{i}"
+        sample_values = [row[i] if i < len(row) else "" for row in rows]
+        data_type = _detect_data_type(sample_values)
+        col_def = {
+            "name": col_name,
+            "display_name": header,
+            "data_type": data_type,
+            "horizontal_align": "left",
+        }
+        if data_type == "number":
+            col_def["horizontal_align"] = "right"
+        columns.append(col_def)
+
+    card_rows = []
+    for row in rows:
+        row_data = {}
+        for i, header in enumerate(headers):
+            col_name = f"col{i}"
+            value = row[i] if i < len(row) else ""
+            if columns[i]["data_type"] == "number":
+                cleaned = re.sub(r"[%¥$€£,]", "", value).strip()
+                try:
+                    if value.strip().startswith("+"):
+                        cleaned = cleaned.lstrip("+")
+                    row_data[col_name] = float(cleaned)
+                except ValueError:
+                    row_data[col_name] = value
+            else:
+                row_data[col_name] = value
+        card_rows.append(row_data)
+
+    return {
+        "tag": "table",
+        "page_size": 10,
+        "row_height": "low",
+        "header_style": {
+            "text_align": "left",
+            "text_size": "normal",
+            "background_style": "grey",
+            "text_color": "default",
+            "bold": True,
+        },
+        "columns": columns,
+        "rows": card_rows,
+    }
+
+
+def _build_table_card_payload(content: str) -> Optional[str]:
+    """Build an interactive card payload with table component(s) from Markdown table(s).
+
+    Supports multiple tables in a single message. Returns None if no valid table is found.
+    """
+    elements_list = _parse_all_markdown_tables(content)
+
+    if not elements_list:
+        return None
+
+    # Check if there's at least one table
+    has_table = any(e["type"] == "table" for e in elements_list)
+    if not has_table:
+        return None
+
+    elements = []
+    for elem in elements_list:
+        if elem["type"] == "text":
+            elements.append({"tag": "markdown", "content": elem["content"]})
+        elif elem["type"] == "table":
+            if not elem["headers"] or not elem["rows"]:
+                continue
+            elements.append(_build_table_element(elem["headers"], elem["rows"]))
+
+    if not elements:
+        return None
+
+    card = {
+        "config": {"wide_screen_mode": True},
+        "elements": elements,
+    }
+
+    return json.dumps(card, ensure_ascii=False)
+
+
+def parse_feishu_post_payload(payload: Any) -> FeishuPostParseResult:
     resolved = _resolve_post_payload(payload)
     if not resolved:
         return FeishuPostParseResult(text_content=FALLBACK_POST_TEXT)
@@ -1812,6 +2083,104 @@ class FeishuAdapter(BasePlatformAdapter):
             ],
         }
 
+    async def send_clarify_card(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[List[str]] = None,
+        session_key: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an interactive card with choice buttons for the clarify tool."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            clarify_id = str(uuid.uuid4())[:8]
+
+            elements = [
+                {
+                    "tag": "markdown",
+                    "content": question,
+                },
+            ]
+
+            if choices:
+                def _clarify_btn(label: str, idx: int) -> dict:
+                    return {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": label},
+                        "type": "default",
+                        "value": {
+                            "hermes_action": "clarify_choice",
+                            "clarify_id": clarify_id,
+                            "choice_index": idx,
+                            "choice_text": label,
+                            "session_key": session_key,
+                        },
+                    }
+
+                elements.append({
+                    "tag": "action",
+                    "actions": [
+                        _clarify_btn(c, i) for i, c in enumerate(choices)
+                    ],
+                })
+            else:
+                elements.append({
+                    "tag": "note",
+                    "elements": [{"tag": "plain_text", "content": "💬 请直接回复你的答案"}],
+                })
+
+            card = {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {"content": "❓ 请选择", "tag": "plain_text"},
+                    "template": "blue",
+                },
+                "elements": elements,
+            }
+
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=None,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "send_clarify_card failed")
+        except Exception as exc:
+            logger.warning("[Feishu] send_clarify_card failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _update_clarify_card(
+        self, message_id: str, choice_text: str, user_name: str,
+    ) -> None:
+        """Replace the clarify card with a resolved status card."""
+        if not self._client or not message_id:
+            return
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "✅ 已选择", "tag": "plain_text"},
+                "template": "green",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"**{choice_text}** — {user_name}",
+                },
+            ],
+        }
+        try:
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await self._client.update_message(message_id, msg_type="interactive", content=payload)
+            if not response.get("success", False):
+                logger.warning("[Feishu] Failed to update clarify card %s: %s", message_id, response.get("error", "Unknown error"))
+        except Exception as exc:
+            logger.warning("[Feishu] Failed to update clarify card %s: %s", message_id, exc)
+
     async def send_voice(
         self,
         chat_id: str,
@@ -2034,6 +2403,65 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Failed to get chat info for %s", chat_id, exc_info=True)
             return fallback
 
+    async def get_chat_messages(
+        self,
+        chat_id: str,
+        page_size: int = 20,
+        sort_type: str = "ByCreateTimeDesc",
+    ) -> List[Dict[str, Any]]:
+        """Get messages from a chat.
+        
+        Args:
+            chat_id: The chat ID to fetch messages from
+            page_size: Number of messages to retrieve (max 50)
+            sort_type: Sort order ("ByCreateTimeAsc" or "ByCreateTimeDesc")
+        
+        Returns:
+            List of message dictionaries
+        """
+        if not self._client:
+            logger.warning("[Feishu] Client not available for get_chat_messages")
+            return []
+        
+        try:
+            response = await self._client.get_messages(
+                container_id_type="chat",
+                container_id=chat_id,
+                page_size=page_size,
+                sort_type=sort_type,
+            )
+            
+            if not response or getattr(response, "success", lambda: False)() is False:
+                code = getattr(response, "code", "unknown")
+                msg = getattr(response, "msg", "message list lookup failed")
+                logger.warning("[Feishu] Failed to get messages for chat %s: [%s] %s", chat_id, code, msg)
+                return []
+            
+            data = getattr(response, "data", None)
+            items = getattr(data, "items", None) or []
+            
+            # Convert SimpleNamespace items to dicts
+            messages = []
+            for item in items:
+                if isinstance(item, dict):
+                    messages.append(item)
+                elif hasattr(item, "__dict__"):
+                    # More efficient conversion for SimpleNamespace objects
+                    messages.append(vars(item))
+                else:
+                    # Fallback for other types
+                    msg_dict = {}
+                    for key in dir(item):
+                        if not key.startswith("_"):
+                            value = getattr(item, key, None)
+                            msg_dict[key] = value
+                    messages.append(msg_dict)
+            
+            return messages
+        except Exception:
+            logger.warning("[Feishu] Failed to get messages for chat %s", chat_id, exc_info=True)
+            return []
+
     def format_message(self, content: str) -> str:
         """Feishu text messages are plain text by default."""
         return content.strip()
@@ -2195,8 +2623,15 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         message_id = getattr(message, "message_id", None)
+        event_id = getattr(getattr(data, "header", None), "event_id", None) or None
+
         if not message_id or self._is_duplicate(message_id):
-            logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
+            event_suffix = f" event_id={event_id}" if event_id else ""
+            logger.debug(
+                "[Feishu] Dropping duplicate/missing message_id=%s%s",
+                message_id,
+                event_suffix,
+            )
             return
         if self._is_self_sent_bot_message(event):
             logger.debug("[Feishu] Dropping self-sent bot event: %s", message_id)
@@ -2205,7 +2640,7 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_type = getattr(message, "chat_type", "p2p")
         chat_id = getattr(message, "chat_id", "") or ""
         if chat_type != "p2p" and not self._should_accept_group_message(message, sender_id, chat_id):
-            logger.debug("[Feishu] Dropping group message that failed mention/policy gate: %s", message_id)
+            logger.info("[Feishu] Dropping group message that failed mention/policy gate: %s", message_id)
             return
         await self._process_inbound_message(
             data=data,
@@ -2961,6 +3396,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._clear_webhook_anomaly(remote_ip)
 
         event_type = str((payload.get("header") or {}).get("event_type") or "")
+        event_id = str((payload.get("header") or {}).get("event_id") or "")
+        if event_id:
+            logger.info("[Feishu] Webhook event: id=%s type=%s", event_id, event_type)
         data = self._namespace_from_mapping(payload)
         if event_type == "im.message.receive_v1":
             self._on_message_event(data)
@@ -3670,6 +4108,8 @@ class FeishuAdapter(BasePlatformAdapter):
             mention_open_id = (getattr(mention_id, "open_id", None) or "").strip()
             mention_user_id = (getattr(mention_id, "user_id", None) or "").strip()
             mention_name = (getattr(mention, "name", None) or "").strip()
+            logger.warning("[Feishu] mention check: open_id=%s user_id=%s name=%r bot_open_id=%s bot_user_id=%s bot_name=%r",
+                         mention_open_id, mention_user_id, mention_name, self._bot_open_id, self._bot_user_id, self._bot_name)
 
             if mention_open_id and self._bot_open_id:
                 if mention_open_id == self._bot_open_id:
@@ -3829,6 +4269,11 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        # First, check if content contains a Markdown table
+        table_card = _build_table_card_payload(content)
+        if table_card:
+            return "interactive", table_card
+
         if _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}

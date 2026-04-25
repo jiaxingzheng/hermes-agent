@@ -1434,7 +1434,7 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         adapter = FeishuAdapter(pconfig)
         domain_name = getattr(adapter, "_domain_name", "feishu")
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
-        adapter._client = adapter._build_lark_client(domain)
+        adapter._client = adapter._build_feishu_client(domain)
         metadata = {"thread_id": thread_id} if thread_id else None
 
         last_result = None
