@@ -841,7 +841,10 @@ def _build_table_card_payload(content: str) -> Optional[str]:
     return json.dumps(card, ensure_ascii=False)
 
 
-def parse_feishu_post_payload(payload: Any) -> FeishuPostParseResult:
+def parse_feishu_post_payload(
+    payload: Any,
+    mentions_map: Optional[Dict[str, FeishuMentionRef]] = None,
+) -> FeishuPostParseResult:
     resolved = _resolve_post_payload(payload)
     if not resolved:
         return FeishuPostParseResult(text_content=FALLBACK_POST_TEXT)
@@ -1162,6 +1165,11 @@ def _normalize_share_chat_message(payload: Dict[str, Any]) -> FeishuNormalizedMe
 
 def _normalize_interactive_message(message_type: str, payload: Dict[str, Any]) -> FeishuNormalizedMessage:
     card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else payload
+    logger.info(
+        "[Feishu] Normalizing interactive message: payload_keys=%s, card_type=%s",
+        list(payload.keys()),
+        card_payload.get("type") if isinstance(card_payload, dict) else None,
+    )
     title = _first_non_empty_text(
         _find_header_title(card_payload),
         payload.get("title"),
@@ -1169,6 +1177,17 @@ def _normalize_interactive_message(message_type: str, payload: Dict[str, Any]) -
     )
     body_lines = _collect_card_lines(card_payload)
     actions = _collect_action_labels(card_payload)
+
+    # 兜底：如果标题仍为空，使用正文第一行
+    if not title and body_lines:
+        title = body_lines[0]
+
+    logger.info(
+        "[Feishu] Interactive message: title=%r, body_lines_count=%d, actions_count=%d",
+        title,
+        len(body_lines),
+        len(actions),
+    )
 
     lines: List[str] = []
     if title:
@@ -1232,7 +1251,7 @@ def _collect_forward_entries(payload: Dict[str, Any]) -> List[str]:
 
 
 def _collect_card_lines(payload: Any) -> List[str]:
-    lines = _collect_text_segments(payload, in_rich_block=False)
+    lines = _collect_text_segments(payload, in_rich_block=True)  # 修复：根节点也作为富文本块处理
     normalized = [_normalize_feishu_text(line) for line in lines]
     return _unique_lines([line for line in normalized if line])
 
@@ -1281,6 +1300,11 @@ def _collect_text_segments(value: Any, *, in_rich_block: bool) -> List[str]:
         "select_static",
         "date_picker",
     }
+
+    logger.debug(
+        "[Feishu DEBUG] _collect_text_segments: tag=%s, in_rich_block=%s, next=%s, keys=%s",
+        tag, in_rich_block, next_in_rich_block, list(value.keys())[:8]
+    )
 
     segments: List[str] = []
     for key in _SUPPORTED_CARD_TEXT_KEYS:
@@ -3134,9 +3158,17 @@ class FeishuAdapter(BasePlatformAdapter):
 
         reply_to_message_id = (
             getattr(message, "parent_id", None)
-            or getattr(message, "upper_message_id", None)
+            or getattr(message, "root_id", None)
             or None
         )
+        if reply_to_message_id:
+            logger.info(
+                "[Feishu] Message %s is replying to parent_id=%s root_id=%s → fetched_id=%s",
+                message_id,
+                getattr(message, "parent_id", None),
+                getattr(message, "root_id", None),
+                reply_to_message_id,
+            )
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
 
         logger.info(
@@ -3969,7 +4001,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client or not message_id:
             return None
         if message_id in self._message_text_cache:
-            return self._message_text_cache[message_id]
+            cached = self._message_text_cache[message_id]
+            logger.debug("[Feishu] Cache hit for parent message %s: %r", message_id, cached[:100] if cached else None)
+            return cached
+        logger.info("[Feishu] Fetching parent message text via API: %s", message_id)
         try:
             request = self._build_get_message_request(message_id)
             response = await asyncio.to_thread(self._client.im.v1.message.get, request)
@@ -3980,16 +4015,27 @@ class FeishuAdapter(BasePlatformAdapter):
                 return None
             items = getattr(getattr(response, "data", None), "items", None) or []
             parent = items[0] if items else None
+            if not parent:
+                logger.warning("[Feishu] Parent message %s not found in response", message_id)
+                return None
             body = getattr(parent, "body", None)
             msg_type = getattr(parent, "msg_type", "") or ""
             raw_content = getattr(body, "content", "") or ""
             parent_mentions = getattr(parent, "mentions", None) if parent else None
+            logger.info(
+                "[Feishu] Parent message %s: type=%s, mentions=%s, raw_content_len=%d",
+                message_id,
+                msg_type,
+                "yes" if parent_mentions else "no",
+                len(raw_content),
+            )
             text = self._extract_text_from_raw_content(
                 msg_type=msg_type,
                 raw_content=raw_content,
                 mentions=parent_mentions,
             )
             self._message_text_cache[message_id] = text
+            logger.info("[Feishu] Extracted parent text (first 120 chars): %r", text[:120] if text else None)
             return text
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)

@@ -556,11 +556,17 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Feishu: use adapter's native media support ---
+    if platform == Platform.FEISHU and media_files:
+        return await _send_feishu(
+            pconfig, chat_id, message, media_files=media_files, thread_id=thread_id
+        )
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, and feishu; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -568,7 +574,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, and feishu"
         )
 
     last_result = None
@@ -1434,7 +1440,7 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         adapter = FeishuAdapter(pconfig)
         domain_name = getattr(adapter, "_domain_name", "feishu")
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
-        adapter._client = adapter._build_feishu_client(domain)
+        adapter._client = adapter._build_lark_client(domain)
         metadata = {"thread_id": thread_id} if thread_id else None
 
         last_result = None
